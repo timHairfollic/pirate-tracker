@@ -1,5 +1,5 @@
 """
-Fortnite Pirate Token Chest Tracker (with team sync) - v7
+Fortnite Pirate Token Chest Tracker (with team sync) - v8
 --------------------------------------------------------
 UP arrow   = +1 chest (works even while Fortnite is focused)
 DOWN arrow = undo your last chest
@@ -35,7 +35,7 @@ except ImportError:
     mb.showerror("Missing package", "Open Command Prompt and run:\n\npython -m pip install pynput\n\nthen start the tracker again.")
     raise SystemExit
 
-APP_VERSION = 7
+APP_VERSION = 8
 # Where updates come from. version.txt holds the newest version number;
 # pirate_token_tracker.pyw next to it is the new app. Leave "" to turn updates off.
 UPDATE_BASE = "https://raw.githubusercontent.com/timHairfollic/pirate-tracker/main/"
@@ -57,6 +57,144 @@ SERIF = "Georgia"
 BURN_LAYERS = [(4, 22, "#2a160a"), (10, 20, "#4a2a12"), (16, 18, "#6e4420"), (22, 16, "#94652f"),
                (28, 14, "#b78a4c"), (34, 12, "#d1ad70"), (40, 10, BG)]
 CHECKPOINTS = [1, 5, 10, 25, 50, 75, 90]   # % milestones on the progress trail
+
+# ---- Auto-count (screen reading) ----
+# Only a box around the interaction prompt is captured, as a fraction of the screen,
+# so it works at any resolution. Nothing touches the Fortnite process or its files.
+AUTO_REGION = (0.36, 0.46, 0.78, 0.84)       # left, top, right, bottom
+AUTO_MIN_HOLD = 0.25                          # seconds the interact key must be held on a chest prompt
+AUTO_PKGS = ["dxcam", "numpy", "winrt-runtime", "winrt-Windows.Media.Ocr", "winrt-Windows.Graphics.Imaging",
+             "winrt-Windows.Storage.Streams", "winrt-Windows.Globalization", "winrt-Windows.Foundation",
+             "winrt-Windows.Foundation.Collections"]
+
+
+def python_console_exe():
+    exe = sys.executable
+    if exe.lower().endswith("pythonw.exe"):
+        alt = exe[:-11] + "python.exe"
+        if os.path.exists(alt):
+            return alt
+    return exe
+
+
+class AutoCounter:
+    """Watches the interaction prompt with Windows screen capture + Windows text recognition."""
+
+    def __init__(self, app):
+        self.app = app
+        self.stop_evt = threading.Event()
+        self.thread = None
+        self.key = "e"
+        self.key_down = False
+        self.last_key_up = 0.0
+        self.status = "off"
+        self.last_text = ""
+
+    @staticmethod
+    def deps_ok():
+        try:
+            import dxcam, numpy  # noqa: F401
+            from winrt.windows.media.ocr import OcrEngine  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def key_event(self, name, down):
+        if name != self.key:
+            return
+        if down:
+            self.key_down = True
+        else:
+            self.key_down = False
+            self.last_key_up = time.time()
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_evt.clear()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_evt.set()
+        self.status = "off"
+
+    def set_status(self, text):
+        self.status = text
+        self.app.root.after(0, self.app.refresh_auto)
+
+    def _make_engine(self):
+        from winrt.windows.media.ocr import OcrEngine
+        engine = OcrEngine.try_create_from_user_profile_languages()
+        if engine is None:
+            from winrt.windows.globalization import Language
+            engine = OcrEngine.try_create_from_language(Language("en-US"))
+        if engine is None:
+            raise RuntimeError("Windows text recognition isn't available (add English in Windows language settings)")
+        return engine
+
+    @staticmethod
+    def _to_bitmap(frame):
+        from winrt.windows.graphics.imaging import SoftwareBitmap, BitmapPixelFormat, BitmapAlphaMode
+        h, w = frame.shape[:2]
+        data = frame.tobytes()
+        try:
+            from winrt.windows.storage.streams import DataWriter
+            dw = DataWriter()
+            dw.write_bytes(data)
+            buf = dw.detach_buffer()
+        except Exception:
+            from winrt.windows.storage.streams import Buffer
+            buf = Buffer(len(data))
+            memoryview(buf)[:len(data)] = data
+            buf.length = len(data)
+        return SoftwareBitmap.create_copy_from_buffer(buf, BitmapPixelFormat.BGRA8, w, h, BitmapAlphaMode.PREMULTIPLIED)
+
+    def run(self):
+        try:
+            import asyncio
+            import dxcam
+            engine = self._make_engine()
+            cam = dxcam.create(output_color="BGRA")
+            W, H = cam.width, cam.height
+            box = (int(AUTO_REGION[0] * W), int(AUTO_REGION[1] * H), int(AUTO_REGION[2] * W), int(AUTO_REGION[3] * H))
+            loop = asyncio.new_event_loop()
+            self.set_status(f"watching ({W}×{H})")
+            held, armed, misses, cooldown, prev = 0.0, False, 0, 0.0, time.time()
+            visible = False
+            while not self.stop_evt.is_set():
+                t0 = time.time()
+                frame = cam.grab(region=box)
+                if frame is not None:                       # None = screen hasn't changed; keep last state
+                    res = loop.run_until_complete(engine.recognize_async(self._to_bitmap(frame)))
+                    text = (res.text or "").strip()
+                    low = text.lower()
+                    visible = "chest" in low and "ammo" not in low
+                    self.last_text = text[:70]
+                now = time.time()
+                if visible:
+                    misses = 0
+                    if self.key_down:
+                        held += now - prev
+                        if held >= AUTO_MIN_HOLD:
+                            armed = True
+                else:
+                    misses += 1
+                    if misses >= 2:
+                        recently_held = self.key_down or now - self.last_key_up < 1.5
+                        if armed and recently_held and now >= cooldown:
+                            cooldown = now + 1.5
+                            self.app.root.after(0, self.app.auto_add)
+                        armed, held = False, 0.0
+                prev = now
+                self.app.root.after(0, self.app.refresh_auto)
+                self.stop_evt.wait(max(0.05, 0.2 - (time.time() - t0)))
+            try:
+                del cam
+            except Exception:
+                pass
+        except Exception as e:
+            self.set_status(f"error: {e}"[:90])
 
 
 def odds_from_counts(counts):
@@ -117,6 +255,9 @@ class Tracker:
         self.sending = False
         self.send_error = False
         self.updating = False
+        self.auto = AutoCounter(self)
+        self.auto_on = False
+        self.capture_key = False
         self.load()
 
         root.title(f"Pirate Token Tracker v{APP_VERSION}")
@@ -193,6 +334,16 @@ class Tracker:
         self.status_lbl = tk.Label(page, bg=BG, fg=DIM, font=F["plain"])
         self.status_lbl.pack(pady=(4, 0))
 
+        auto_row = tk.Frame(page, bg=BG)
+        auto_row.pack(pady=(8, 0))
+        tk.Label(auto_row, text="Auto-count:", bg=BG, fg=TEXT, font=F["body"]).pack(side="left")
+        self.auto_btn = tk.Button(auto_row, text="Off", command=self.toggle_auto, width=5, **self.btn_style())
+        self.auto_btn.pack(side="left", padx=4)
+        self.key_btn = tk.Button(auto_row, text="Key: E", command=self.pick_key, width=8, **self.btn_style())
+        self.key_btn.pack(side="left", padx=2)
+        self.auto_lbl = tk.Label(page, bg=BG, fg=DIM, font=F["plain"], wraplength=380, justify="center")
+        self.auto_lbl.pack(pady=(2, 0))
+
         tk.Checkbutton(page, text="Keep on top of game", variable=self.on_top, bg=BG, fg=DIM,
                        selectcolor="#f3e4bf", activebackground=BG, activeforeground=TEXT, font=F["plain"],
                        command=lambda: root.attributes("-topmost", self.on_top.get())).pack(pady=(6, 0))
@@ -218,8 +369,11 @@ class Tracker:
             self.room_var.set(self.room)
             self.enter_room(self.room)
         self.refresh()
-        keyboard.Listener(on_press=self.on_key, daemon=True).start()
+        keyboard.Listener(on_press=self.on_key, on_release=self.on_key_up, daemon=True).start()
         root.protocol("WM_DELETE_WINDOW", self.close)
+        self.refresh_auto()
+        if self.auto_on and AutoCounter.deps_ok():
+            self.auto.start()
         self.root.after(1500, self.check_for_update)
 
     # ---------- state helpers ----------
@@ -388,11 +542,96 @@ class Tracker:
                                       f"({self.mode.get().split(' (')[0].replace('Treasure Hour ', 'TH ')} rate)")
 
     # ---------- input ----------
+    @staticmethod
+    def key_name(key):
+        try:
+            if getattr(key, "char", None):
+                return key.char.lower()
+        except Exception:
+            pass
+        return str(getattr(key, "name", key)).lower()
+
     def on_key(self, key):
+        name = self.key_name(key)
+        if self.capture_key and key not in (keyboard.Key.up, keyboard.Key.down):
+            self.capture_key = False
+            self.auto.key = name
+            self.root.after(0, lambda: (self.refresh_auto(), self.save()))
+            return
+        self.auto.key_event(name, True)
         if key == keyboard.Key.up:
             self.root.after(0, self.add)
         elif key == keyboard.Key.down:
             self.root.after(0, self.undo)
+
+    def on_key_up(self, key):
+        self.auto.key_event(self.key_name(key), False)
+
+    # ---------- auto-count controls ----------
+    def toggle_auto(self):
+        if self.auto_on:
+            self.auto_on = False
+            self.auto.stop()
+            self.refresh_auto(); self.save()
+            return
+        if not AutoCounter.deps_ok():
+            if not mb.askyesno("Turn on auto-count?",
+                               "Auto-count needs a few free add-ons (screen capture + Windows text reading, "
+                               "about 10 MB) installed into Python.\n\nInstall them now?", parent=self.root):
+                return
+            self.auto.status = "installing add-ons… (about a minute)"
+            self.refresh_auto()
+
+            def worker():
+                try:
+                    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    subprocess.run([python_console_exe(), "-m", "pip", "install", *AUTO_PKGS],
+                                   check=True, capture_output=True, creationflags=flags)
+                    import importlib
+                    importlib.invalidate_caches()
+                    ok = AutoCounter.deps_ok()
+                except Exception:
+                    ok = False
+                self.root.after(0, lambda: self._after_install(ok))
+            threading.Thread(target=worker, daemon=True).start()
+            return
+        self.auto_on = True
+        self.auto.start()
+        self.refresh_auto(); self.save()
+
+    def _after_install(self, ok):
+        if not ok:
+            self.auto.status = "couldn't install the add-ons — check your internet and try again"
+            self.refresh_auto()
+            return
+        self.auto_on = True
+        self.auto.start()
+        self.refresh_auto(); self.save()
+
+    def pick_key(self):
+        self.capture_key = True
+        self.key_btn.config(text="Press key…")
+
+    def auto_add(self):
+        if self.updating or not self.auto_on:
+            return
+        self.add()
+        self.auto.status = f"✓ auto-counted a chest at {time.strftime('%I:%M:%S %p').lstrip('0')}"
+        self.refresh_auto()
+
+    def refresh_auto(self):
+        if not hasattr(self, "auto_btn"):
+            return
+        self.auto_btn.config(text="On" if self.auto_on else "Off", fg=GREEN if self.auto_on else TEXT)
+        if not self.capture_key:
+            self.key_btn.config(text=f"Key: {self.auto.key.upper()}")
+        if self.auto_on:
+            seen = f"   ·   sees: “{self.auto.last_text}”" if self.auto.last_text else ""
+            self.auto_lbl.config(text=f"👁 {self.auto.status}{seen}")
+        elif self.auto.status not in ("off", ""):
+            self.auto_lbl.config(text=self.auto.status)
+        else:
+            self.auto_lbl.config(text="Hold your interact key on a chest and it counts itself (Up arrow still works)")
 
     def changed(self):
         if self.room:
@@ -735,7 +974,8 @@ class Tracker:
         try:
             with open(SAVE_FILE, "w") as f:
                 json.dump({"v": 4, "cid": self.cid, "name": self.name, "solo": self.solo, "mode": self.mode.get(), "room": self.room,
-                           "rooms": self.rooms, "geometry": self.root.winfo_geometry()}, f)
+                           "rooms": self.rooms, "geometry": self.root.winfo_geometry(),
+                           "auto_on": self.auto_on, "auto_key": self.auto.key}, f)
         except (OSError, tk.TclError):
             pass
 
@@ -746,6 +986,8 @@ class Tracker:
         except (OSError, ValueError):
             return
         self._saved_geometry = data.get("geometry")
+        self.auto_on = bool(data.get("auto_on"))
+        self.auto.key = str(data.get("auto_key") or "e")
         if data.get("mode") in MODES:
             self.mode.set(data["mode"])
         v = data.get("v")
@@ -768,6 +1010,7 @@ class Tracker:
             self.solo = [float(m) for m in old_rooms[old_room].get("history", [])]
 
     def close(self):
+        self.auto.stop()
         if self.room and self.dirty and self.R is not None:
             try:
                 db_request(f"rooms/{self.room}/players/{self.cid}", "PUT",
