@@ -1,5 +1,5 @@
 """
-Fortnite Pirate Token Chest Tracker (with Duo sync) - v5
+Fortnite Pirate Token Chest Tracker (with Duo sync) - v6
 --------------------------------------------------------
 UP arrow   = +1 chest (works even while Fortnite is focused)
 DOWN arrow = undo your last chest
@@ -35,7 +35,7 @@ except ImportError:
     mb.showerror("Missing package", "Open Command Prompt and run:\n\npython -m pip install pynput\n\nthen start the tracker again.")
     raise SystemExit
 
-APP_VERSION = 5
+APP_VERSION = 6
 # Where updates come from. version.txt holds the newest version number;
 # pirate_token_tracker.pyw next to it is the new app. Leave "" to turn updates off.
 UPDATE_BASE = "https://raw.githubusercontent.com/timHairfollic/pirate-tracker/main/"
@@ -56,6 +56,7 @@ CHAR = "#120a04"                      # burnt edge
 SERIF = "Georgia"
 BURN_LAYERS = [(4, 22, "#2a160a"), (10, 20, "#4a2a12"), (16, 18, "#6e4420"), (22, 16, "#94652f"),
                (28, 14, "#b78a4c"), (34, 12, "#d1ad70"), (40, 10, BG)]
+CHECKPOINTS = [1, 5, 10, 25, 50, 75, 90]   # % milestones on the progress trail
 
 
 def odds_from_counts(counts):
@@ -154,6 +155,12 @@ class Tracker:
         self.per_lbl = tk.Label(inner, bg=CARD, fg=DIM, font=F["plain"])
         self.per_lbl.pack(pady=(4, 0))
 
+        self.prog = tk.Canvas(page, bg=BG, highlightthickness=0, height=58, width=420)
+        self.prog.pack(pady=(8, 0), fill="x", padx=10)
+        self.prog.bind("<Configure>", lambda e: self.draw_progress())
+        self.next_lbl = tk.Label(page, bg=BG, fg=TEXT, font=F["body"])
+        self.next_lbl.pack(pady=(0, 2))
+
         row = tk.Frame(page, bg=BG)
         row.pack(pady=(10, 6))
         tk.Label(row, text="Rate:", bg=BG, fg=TEXT, font=F["body"]).pack(side="left")
@@ -247,6 +254,8 @@ class Tracker:
             f.configure(size=max(7, int(self.base_sizes[k] * scale)))
         self.header.config(height=int(74 * scale), width=int(420 * scale))
         self.draw_header()
+        self.prog.config(height=int(58 * scale), width=int(420 * scale))
+        self.draw_progress()
 
     # ---------- treasure-map drawing ----------
     def btn_style(self):
@@ -322,6 +331,58 @@ class Tracker:
                       font=(SERIF, max(9, int(19 * s)), "bold italic"))
         c.create_text(cx, cy + 16 * s, text="☠  a ledger of chests plundered  ☠", fill=DIM,
                       font=(SERIF, max(7, int(9 * s)), "italic"))
+
+    def chests_to(self, target_pct):
+        """Chests still needed (at the current Rate) to reach target_pct overall chance."""
+        miss = 1 - odds_from_counts(self.total_counts())
+        goal_miss = 1 - target_pct / 100
+        if miss <= goal_miss:
+            return 0
+        p = BASE_RATE * MODES[self.mode.get()]
+        return math.ceil(math.log(goal_miss / miss) / math.log(1 - p))
+
+    def draw_progress(self):
+        c = self.prog
+        c.delete("all")
+        w = max(c.winfo_width(), 200)
+        h = max(c.winfo_height(), 40)
+        s = self._scale
+        pct = odds_from_counts(self.total_counts()) * 100
+        x0, x1, y = 14 * s, w - 18 * s, h * 0.38
+        seg = (x1 - x0) / len(CHECKPOINTS)
+        # how far along the trail we are: each checkpoint gets an equal stretch
+        fill_x, prev = x1, 0
+        for i, m in enumerate(CHECKPOINTS):
+            if pct < m:
+                fill_x = x0 + (i + (pct - prev) / (m - prev)) * seg
+                break
+            prev = m
+        lw = max(4, int(10 * s))
+        c.create_line(x0, y, x1, y, fill="#5a3a1c", width=lw + 4, capstyle="round")
+        c.create_line(x0, y, x1, y, fill="#e2c995", width=lw, capstyle="round")
+        if fill_x > x0:
+            c.create_line(x0, y, fill_x, y, fill="#8b3a1a", width=lw, capstyle="round")
+        c.create_line(x0, y, x1, y, fill="#b8935a", width=1, dash=(3, 4))
+        r = max(4, 7 * s)
+        for i, m in enumerate(CHECKPOINTS):
+            x = x0 + (i + 1) * seg
+            if pct >= m:     # reached: mark it with a red X
+                c.create_oval(x - r - 2, y - r - 2, x + r + 2, y + r + 2, fill=BG, outline="#5a3a1c", width=2)
+                c.create_line(x - r * 0.7, y - r * 0.7, x + r * 0.7, y + r * 0.7, fill=RED, width=max(2, int(3 * s)))
+                c.create_line(x - r * 0.7, y + r * 0.7, x + r * 0.7, y - r * 0.7, fill=RED, width=max(2, int(3 * s)))
+            else:
+                c.create_oval(x - r, y - r, x + r, y + r, fill="#f3e4bf", outline="#6b4a2b", width=2)
+            c.create_text(x, y + r + 10 * s, text=f"{m}%", fill=TEXT if pct >= m else DIM,
+                          font=(SERIF, max(7, int(9 * s)), "bold" if pct >= m else "normal"))
+        # little ship marking where you are on the trail
+        c.create_text(max(x0, fill_x), y - r - 9 * s, text="⛵", fill=TEXT, font=("Segoe UI Emoji", max(8, int(12 * s))))
+        nxt = next((m for m in CHECKPOINTS if pct < m), None)
+        if nxt is None:
+            self.next_lbl.config(text="Every checkpoint passed — ye be a legend o' the seas!")
+        else:
+            left = self.chests_to(nxt)
+            self.next_lbl.config(text=f"Next checkpoint: {nxt}%  —  {left:,} chests to go "
+                                      f"({self.mode.get().split(' (')[0].replace('Treasure Hour ', 'TH ')} rate)")
 
     # ---------- input ----------
     def on_key(self, key):
@@ -616,6 +677,7 @@ class Tracker:
         self.odds_lbl.config(text=f"{pct:.{decimals}f}%")
         mult = MODES[self.mode.get()]
         self.per_lbl.config(text=f"Per chest now: {BASE_RATE * mult * 100:.5f}%  (1 in {round(1 / (BASE_RATE * mult)):,})")
+        self.draw_progress()
         if self.room:
             mine = len(self.R["mine"])
             split = f"You: {mine:,}"
