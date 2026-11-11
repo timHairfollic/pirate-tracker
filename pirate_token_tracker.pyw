@@ -1,5 +1,5 @@
 """
-Fortnite Pirate Token Chest Tracker (with team sync) - v8
+Fortnite Pirate Token Chest Tracker (with team sync) - v9
 --------------------------------------------------------
 UP arrow   = +1 chest (works even while Fortnite is focused)
 DOWN arrow = undo your last chest
@@ -35,7 +35,7 @@ except ImportError:
     mb.showerror("Missing package", "Open Command Prompt and run:\n\npython -m pip install pynput\n\nthen start the tracker again.")
     raise SystemExit
 
-APP_VERSION = 8
+APP_VERSION = 9
 # Where updates come from. version.txt holds the newest version number;
 # pirate_token_tracker.pyw next to it is the new app. Leave "" to turn updates off.
 UPDATE_BASE = "https://raw.githubusercontent.com/timHairfollic/pirate-tracker/main/"
@@ -333,6 +333,13 @@ class Tracker:
         self.code_btn.pack(side="left", padx=2)
         self.status_lbl = tk.Label(page, bg=BG, fg=DIM, font=F["plain"])
         self.status_lbl.pack(pady=(4, 0))
+
+        name_row = tk.Frame(page, bg=BG)
+        name_row.pack(pady=(4, 0))
+        tk.Label(name_row, text="Your name:", bg=BG, fg=TEXT, font=F["body"]).pack(side="left")
+        self.name_lbl = tk.Label(name_row, bg=BG, fg=GOLD, font=F["body"])
+        self.name_lbl.pack(side="left", padx=4)
+        tk.Button(name_row, text="Change", command=self.rename, width=7, **self.btn_style()).pack(side="left", padx=2)
 
         auto_row = tk.Frame(page, bg=BG)
         auto_row.pack(pady=(8, 0))
@@ -936,6 +943,8 @@ class Tracker:
         size = 1 + len(self.others) if self.room else 1
         team_word = {2: "DUO", 3: "TRIO", 4: "SQUAD"}.get(size, "CREW" if size > 4 else "TEAM")
         self.count_title.config(text=f"{team_word} CHESTS OPENED" if self.room else "CHESTS OPENED")
+        if hasattr(self, "name_lbl"):
+            self.name_lbl.config(text=self.name or "not set yet")
         self.count_lbl.config(text=f"{n:,}")
         self.odds_lbl.config(text=f"{pct:.{decimals}f}%")
         mult = MODES[self.mode.get()]
