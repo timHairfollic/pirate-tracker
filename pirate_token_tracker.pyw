@@ -1,5 +1,5 @@
 """
-Fortnite Pirate Token Chest Tracker (with Duo sync) - v2
+Fortnite Pirate Token Chest Tracker (with Duo sync) - v3
 --------------------------------------------------------
 UP arrow   = +1 chest (works even while Fortnite is focused)
 DOWN arrow = undo your last chest
@@ -22,6 +22,8 @@ import threading
 import time
 import tkinter as tk
 import tkinter.messagebox as mb
+import tkinter.simpledialog as sd
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -34,7 +36,7 @@ except ImportError:
     mb.showerror("Missing package", "Open Command Prompt and run:\n\npython -m pip install pynput\n\nthen start the tracker again.")
     raise SystemExit
 
-APP_VERSION = 2
+APP_VERSION = 3
 # Where updates come from. version.txt holds the newest version number;
 # pirate_token_tracker.pyw next to it is the new app. Leave "" to turn updates off.
 UPDATE_BASE = "https://raw.githubusercontent.com/timHairfollic/pirate-tracker/main/"
@@ -85,6 +87,7 @@ class Tracker:
         self.last_send = 0.0
         self.send_scheduled = False
         self.send_error = False
+        self.limit_until = None            # time the relay's daily limit resets, if we hit it
         self.load()
 
         root.title(f"Pirate Token Tracker v{APP_VERSION}")
@@ -125,7 +128,7 @@ class Tracker:
 
         btns = tk.Frame(root, bg=BG)
         btns.pack()
-        for txt, cmd in (("+1", self.add), ("Undo", self.undo), ("Reset", self.reset)):
+        for txt, cmd in (("+1", self.add), ("Undo", self.undo), ("Set count", self.set_count), ("Reset", self.reset)):
             tk.Button(btns, text=txt, command=cmd, width=7, bg=CARD, fg=TEXT, relief="flat",
                       activebackground=GOLD, font=F["body"]).pack(side="left", padx=4)
 
@@ -233,6 +236,22 @@ class Tracker:
             self.my_stack().pop()
             self.changed()
 
+    def set_count(self):
+        if getattr(self, "updating", False):
+            return
+        who = "your own" if self.room else "your"
+        n = sd.askinteger("Set count", f"How many chests should {who} count be?\n"
+                          f"(New chests use the current Rate setting.)",
+                          parent=self.root, minvalue=0, maxvalue=10_000_000, initialvalue=len(self.my_stack()))
+        if n is None:
+            return
+        stack = self.my_stack()
+        if n < len(stack):
+            del stack[n:]
+        else:
+            stack.extend([MODES[self.mode.get()]] * (n - len(stack)))
+        self.changed()
+
     def reset(self):
         msg = "Reset the duo count to 0 for BOTH of you?" if self.room else "Reset your chest count to 0?"
         if not mb.askyesno("Reset", msg, parent=self.root):
@@ -316,16 +335,27 @@ class Tracker:
                 req = urllib.request.Request(f"{RELAY}/{topic}", data=json.dumps(payload).encode(), method="POST")
                 urllib.request.urlopen(req, timeout=15).read()
                 self.root.after(0, self._send_ok)
+            except urllib.error.HTTPError as e:
+                until = None
+                if e.code == 429:
+                    try:
+                        acct = json.loads(urllib.request.urlopen(f"{RELAY}/v1/account", timeout=10).read())
+                        until = float(acct["stats"]["reset_at"])
+                    except Exception:
+                        until = time.time() + 3600
+                self.root.after(0, lambda: self._send_failed(until))
             except Exception:
                 self.root.after(0, self._send_failed)
         threading.Thread(target=worker, daemon=True).start()
 
     def _send_ok(self):
         self.send_error = False
+        self.limit_until = None
         self.refresh()
 
-    def _send_failed(self):
+    def _send_failed(self, until=None):
         self.send_error = True
+        self.limit_until = until
         self.dirty = True          # try again next round; nothing is lost
         self.schedule_send()
         self.refresh()
@@ -482,7 +512,10 @@ class Tracker:
             self.code_btn.pack_forget()
             self.sync_btn.pack(side="left", padx=2)
             self.room_entry.config(state="disabled", disabledbackground=CARD, disabledforeground=GOLD)
-            if self.send_error:
+            if self.send_error and self.limit_until and self.limit_until > time.time():
+                when = time.strftime("%I:%M %p", time.localtime(self.limit_until)).lstrip("0")
+                self.status_lbl.config(text=f"⏸ Relay's daily limit reached — your count still saves, sharing resumes ~{when}", fg=GOLD)
+            elif self.send_error:
                 self.status_lbl.config(text="⚠ Couldn't share your count — retrying automatically (no chests lost)", fg=RED)
             elif self.connected:
                 self.status_lbl.config(text=f"● Room {self.room} — your count shares every 2 min (or press Sync now)", fg=GREEN)
