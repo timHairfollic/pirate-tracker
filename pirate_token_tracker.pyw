@@ -1,5 +1,5 @@
 """
-Fortnite Pirate Token Chest Tracker (with team sync) - v9
+Fortnite Pirate Token Chest Tracker (with team sync) - v10
 --------------------------------------------------------
 UP arrow   = +1 chest (works even while Fortnite is focused)
 DOWN arrow = undo your last chest
@@ -24,6 +24,8 @@ import time
 import tkinter as tk
 import tkinter.messagebox as mb
 import tkinter.simpledialog as sd
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from tkinter import font as tkfont
@@ -35,7 +37,7 @@ except ImportError:
     mb.showerror("Missing package", "Open Command Prompt and run:\n\npython -m pip install pynput\n\nthen start the tracker again.")
     raise SystemExit
 
-APP_VERSION = 9
+APP_VERSION = 10
 # Where updates come from. version.txt holds the newest version number;
 # pirate_token_tracker.pyw next to it is the new app. Leave "" to turn updates off.
 UPDATE_BASE = "https://raw.githubusercontent.com/timHairfollic/pirate-tracker/main/"
@@ -224,10 +226,62 @@ def untally(counts):
     return out
 
 
+class FirebaseAuth:
+    """Anonymous sign-in (no email or password) so the database can tell players apart
+    and enforce who may change what: only you can change your count, only the owner can reset or kick."""
+
+    def __init__(self):
+        self.uid = None
+        self.refresh_token = None
+        self.id_token = None
+        self.expires = 0.0
+        self.api_key = None
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _post(url, data, form=False):
+        body = urllib.parse.urlencode(data).encode() if form else json.dumps(data).encode()
+        ctype = "application/x-www-form-urlencoded" if form else "application/json"
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": ctype})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+
+    def token(self):
+        with self.lock:
+            if self.id_token and time.time() < self.expires - 120:
+                return self.id_token
+            if not self.api_key:
+                with urllib.request.urlopen(f"{DB}/config/apiKey.json", timeout=15) as resp:
+                    self.api_key = json.loads(resp.read())
+            if self.refresh_token:
+                try:
+                    r = self._post(f"https://securetoken.googleapis.com/v1/token?key={self.api_key}",
+                                   {"grant_type": "refresh_token", "refresh_token": self.refresh_token}, form=True)
+                    self.id_token, self.refresh_token = r["id_token"], r["refresh_token"]
+                    self.uid = r["user_id"]
+                    self.expires = time.time() + int(r.get("expires_in", 3600))
+                    return self.id_token
+                except urllib.error.HTTPError as e:
+                    if e.code != 400:
+                        raise
+                    self.refresh_token = None        # that account is gone; make a new one
+            r = self._post(f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={self.api_key}",
+                           {"returnSecureToken": True})
+            self.id_token, self.refresh_token, self.uid = r["idToken"], r["refreshToken"], r["localId"]
+            self.expires = time.time() + int(r.get("expiresIn", 3600))
+            return self.id_token
+
+    def fresh(self):
+        return bool(self.id_token) and time.time() < self.expires - 60
+
+
+AUTH = FirebaseAuth()
+
+
 def db_request(path, method="GET", data=None, timeout=15):
     body = None if data is None else json.dumps(data).encode()
-    req = urllib.request.Request(f"{DB}/{path}.json", data=body, method=method,
-                                 headers={"Content-Type": "application/json"})
+    url = f"{DB}/{path}.json?auth={urllib.parse.quote(AUTH.token())}"
+    req = urllib.request.Request(url, data=body, method=method, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read() or b"null")
 
@@ -258,6 +312,8 @@ class Tracker:
         self.auto = AutoCounter(self)
         self.auto_on = False
         self.capture_key = False
+        self.carry = []                    # your chests waiting to go into your next room (after an upgrade or kick)
+        self.migrated = False
         self.load()
 
         root.title(f"Pirate Token Tracker v{APP_VERSION}")
@@ -331,6 +387,7 @@ class Tracker:
         self.join_btn.pack(side="left", padx=2)
         self.code_btn = tk.Button(duo, text="New code", command=self.new_code, **self.btn_style())
         self.code_btn.pack(side="left", padx=2)
+        self.kick_btn = tk.Button(duo, text="Kick", command=self.kick_menu, **self.btn_style())
         self.status_lbl = tk.Label(page, bg=BG, fg=DIM, font=F["plain"])
         self.status_lbl.pack(pady=(4, 0))
 
@@ -382,6 +439,8 @@ class Tracker:
         if self.auto_on and AutoCounter.deps_ok():
             self.auto.start()
         self.root.after(1500, self.check_for_update)
+        if self.migrated:
+            self.root.after(900, self.show_migration_notice)
 
     # ---------- state helpers ----------
     @property
@@ -677,7 +736,7 @@ class Tracker:
 
     def reset(self):
         if self.room and not self.is_leader():
-            mb.showinfo("Reset", "Only the room leader can reset the team count.", parent=self.root)
+            mb.showinfo("Reset", "Only the room owner can reset the team count.", parent=self.root)
             return
         msg = "Reset the team count to 0 for EVERYONE in the room?" if self.room else "Reset your chest count to 0?"
         if not mb.askyesno("Reset", msg, parent=self.root):
@@ -689,7 +748,7 @@ class Tracker:
             self.others = {}
             code, cid = self.room, self.cid
             payload = {"epoch": new_epoch,
-                       "players": {cid: {"c": {}, "epoch": new_epoch, "n": self.name, "t": int(time.time())}}}
+                       f"players/{cid}": {"c": {}, "epoch": new_epoch, "n": self.name, "t": int(time.time())}}
             threading.Thread(target=lambda: self._safe(lambda: db_request(f"rooms/{code}", "PATCH", payload)),
                              daemon=True).start()
         else:
@@ -726,10 +785,13 @@ class Tracker:
         self.room_var.set(code)
         is_new = code not in self.rooms
         self.rooms.setdefault(code, {"mine": [], "epoch": 0})
-        if is_new and self.solo and mb.askyesno(
+        if is_new and self.solo and not self.carry and mb.askyesno(
                 "Bring your chests?", f"You have {len(self.solo):,} solo chests counted.\n"
                                       f"Add them to your count in this team room?", parent=self.root):
             self.rooms[code]["mine"].extend(self.solo)
+        if self.carry:
+            self.rooms[code]["mine"].extend(self.carry)
+            self.carry = []
         if not self.name:
             self.rename(first=True)
         self.enter_room(code)
@@ -747,6 +809,80 @@ class Tracker:
                 self.dirty = True
                 self.push_soon()
             self.refresh(); self.save()
+
+    def leave_room_locally(self):
+        self.room = None
+        self._stream_gen += 1
+        self.connected = False
+        self.others, self.other_names, self.leader = {}, {}, None
+
+    def legacy_room(self, code):
+        if code != self.room:
+            return
+        R = self.rooms.pop(code, {"mine": []})
+        self.carry = R["mine"] + self.carry
+        self.leave_room_locally()
+        self.refresh(); self.save()
+        mb.showinfo("Make a new room", f"Room {code} was made with an older version, so it can't have an owner.\n\n"
+                    "Press New code → Join to make a fresh room, then send the code to your team.\n"
+                    f"Your {len(self.carry):,} chests are kept and will come with you.", parent=self.root)
+
+    def got_kicked(self, code):
+        R = self.rooms.pop(code, {"mine": []})
+        self.solo.extend(R["mine"])
+        self.leave_room_locally()
+        self.refresh(); self.save()
+        mb.showinfo("Removed from room", f"The owner removed you from room {code}.\n"
+                    f"Your {len(R['mine']):,} chests were moved back to your solo count.", parent=self.root)
+
+    def show_migration_notice(self):
+        mb.showinfo("Owner controls are here!",
+                    "Rooms got an upgrade, so your team needs a NEW room code:\n\n"
+                    "• Owner: press New code → Join, then send the code to your team.\n"
+                    "• Everyone else: type that code → Join.\n\n"
+                    f"Your {len(self.carry):,} chests are saved and will come with you into the new room.",
+                    parent=self.root)
+
+    def kick_menu(self):
+        if not self.is_leader():
+            return
+        if not self.others:
+            mb.showinfo("Kick", "No one else is in the room right now.", parent=self.root)
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Kick a player")
+        win.configure(bg=BG)
+        win.attributes("-topmost", True)
+        win.transient(self.root)
+        tk.Label(win, text="Remove a player from the room:", bg=BG, fg=TEXT,
+                 font=self.fonts["body"]).pack(padx=20, pady=(14, 6))
+        for cid, counts in sorted(self.others.items(), key=lambda kv: -sum(kv[1].values())):
+            name = self.other_names.get(cid, "Player")
+            row = tk.Frame(win, bg=BG)
+            row.pack(fill="x", padx=20, pady=2)
+            tk.Label(row, text=f"{name} — {sum(counts.values()):,} chests", bg=BG, fg=TEXT,
+                     font=self.fonts["body"]).pack(side="left")
+            tk.Button(row, text="Kick", width=6, command=lambda c=cid, n=name: (win.destroy(), self.kick(c, n)),
+                      **self.btn_style()).pack(side="right", padx=(12, 0))
+        tk.Button(win, text="Cancel", width=8, command=win.destroy, **self.btn_style()).pack(pady=(10, 14))
+
+    def kick(self, cid, name):
+        if not self.is_leader():
+            return
+        if not mb.askyesno("Kick player", f"Kick {name} from room {self.room}?\n\n"
+                           "Their chests come out of the team count, and they can't rejoin this room.",
+                           parent=self.root):
+            return
+        code, gen = self.room, self._stream_gen
+
+        def worker():
+            try:
+                db_request(f"rooms/{code}", "PATCH", {f"kicked/{cid}": True, f"players/{cid}": None})
+                self.root.after(0, lambda: self.pull(gen, code))
+            except Exception:
+                self.root.after(0, lambda: mb.showerror("Kick", "Couldn't kick them. Check your internet and try again.",
+                                                        parent=self.root))
+        threading.Thread(target=worker, daemon=True).start()
 
     def enter_room(self, code):
         self.room = code
@@ -773,7 +909,8 @@ class Tracker:
 
         def worker():
             try:
-                db_request(f"rooms/{code}/players/{cid}", "PUT", snap)
+                AUTH.token()
+                db_request(f"rooms/{code}/players/{AUTH.uid}", "PUT", snap)
                 self.root.after(0, lambda: self._push_done(True))
             except Exception:
                 self.root.after(0, lambda: self._push_done(False))
@@ -788,16 +925,31 @@ class Tracker:
 
     # ---------- receiving ----------
     def stream_loop(self, gen, code):
-        # Whoever creates the room (first to join it) becomes its leader
+        # Sign in first: your account id is your player id in the room
+        while gen == self._stream_gen:
+            try:
+                AUTH.token()
+                self.cid = AUTH.uid
+                self.root.after(0, self.save)
+                break
+            except Exception:
+                self.root.after(0, lambda: self.set_connected(False))
+                time.sleep(5)
+        # Whoever creates the room (first to join it) becomes its owner
         try:
-            if not db_request(f"rooms/{code}/leader"):
-                db_request(f"rooms/{code}", "PATCH", {"leader": self.cid})
+            leader = db_request(f"rooms/{code}/leader")
+            if not leader:
+                db_request(f"rooms/{code}/leader", "PUT", self.cid)
+            elif len(str(leader)) < 20:              # made by an old version, before owners existed
+                self.root.after(0, lambda: self.legacy_room(code))
+                return
         except Exception:
             pass
         while gen == self._stream_gen:
             try:
                 self.root.after(0, lambda: self.pull(gen, code))
-                req = urllib.request.Request(f"{DB}/rooms/{code}.json", headers={"Accept": "text/event-stream"})
+                url = f"{DB}/rooms/{code}.json?auth={urllib.parse.quote(AUTH.token())}"
+                req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
                 with urllib.request.urlopen(req, timeout=90) as resp:
                     self.root.after(0, lambda: self.set_connected(True))
                     for raw in resp:
@@ -806,6 +958,9 @@ class Tracker:
                         line = raw.decode("utf-8", "ignore").strip()
                         if line in ("event: put", "event: patch"):
                             self.root.after(0, lambda: self.pull(gen, code))
+                        elif line in ("event: auth_revoked", "event: cancel"):
+                            break                    # sign-in expired: reconnect with a fresh one
+                time.sleep(1)
             except Exception:
                 if gen != self._stream_gen:
                     return
@@ -837,10 +992,15 @@ class Tracker:
             R["epoch"] = epoch
             R["mine"].clear()
             self.dirty = True
+        kicked = data.get("kicked") or {}
+        if self.cid in kicked:
+            self.got_kicked(code)
+            return
         self.leader = data.get("leader")
         players = data.get("players") or {}
         team = {cid: p for cid, p in players.items()
-                if cid != self.cid and isinstance(p, dict) and int(p.get("epoch") or 0) == R["epoch"]}
+                if cid != self.cid and cid not in kicked and isinstance(p, dict)
+                and int(p.get("epoch") or 0) == R["epoch"]}
         self.others = {cid: untally(p.get("c")) for cid, p in team.items()}
         self.other_names = {cid: str(p.get("n") or f"Player {cid[:3].upper()}")[:16] for cid, p in team.items()}
         mine_online = players.get(self.cid)
@@ -961,9 +1121,18 @@ class Tracker:
             self.split_lbl.config(text=split + "   ✎", cursor="hand2", wraplength=int(380 * self._scale))
             self.join_btn.config(text="Leave")
             self.code_btn.pack_forget()
+            if self.is_leader():
+                self.kick_btn.pack(side="left", padx=2)
+            else:
+                self.kick_btn.pack_forget()
             self.room_entry.config(state="disabled", disabledbackground=CARD, disabledforeground=GOLD)
             self.reset_btn.config(state="normal" if self.is_leader() else "disabled")
-            crown = "👑 You're the leader · " if self.is_leader() else ""
+            if self.is_leader():
+                crown = "👑 You're the owner · "
+            elif self.leader in self.other_names:
+                crown = f"👑 Owner: {self.other_names[self.leader]} · "
+            else:
+                crown = ""
             if self.send_error:
                 self.status_lbl.config(text="⚠ Couldn't share your count — retrying (no chests lost)", fg=RED)
             elif self.connected:
@@ -973,18 +1142,24 @@ class Tracker:
         else:
             self.split_lbl.config(text="", cursor="")
             self.join_btn.config(text="Join")
+            self.kick_btn.pack_forget()
             self.code_btn.pack(side="left", padx=2)
             self.room_entry.config(state="normal")
             self.reset_btn.config(state="normal")
-            self.status_lbl.config(text="Solo mode — join a room to share chests with your duo, trio or squad", fg=DIM)
+            if self.carry:
+                self.status_lbl.config(text=f"Your {len(self.carry):,} team chests are saved — Join your team's new room "
+                                            "(owner: New code → Join)", fg=GOLD)
+            else:
+                self.status_lbl.config(text="Solo mode — join a room to share chests with your duo, trio or squad", fg=DIM)
 
     # ---------- save / load ----------
     def save(self):
         try:
             with open(SAVE_FILE, "w") as f:
-                json.dump({"v": 4, "cid": self.cid, "name": self.name, "solo": self.solo, "mode": self.mode.get(), "room": self.room,
+                json.dump({"v": 10, "cid": self.cid, "name": self.name, "solo": self.solo, "mode": self.mode.get(), "room": self.room,
                            "rooms": self.rooms, "geometry": self.root.winfo_geometry(),
-                           "auto_on": self.auto_on, "auto_key": self.auto.key}, f)
+                           "auto_on": self.auto_on, "auto_key": self.auto.key, "carry": self.carry,
+                           "fb_uid": AUTH.uid, "fb_refresh": AUTH.refresh_token}, f)
         except (OSError, tk.TclError):
             pass
 
@@ -1000,16 +1175,27 @@ class Tracker:
         if data.get("mode") in MODES:
             self.mode.set(data["mode"])
         v = data.get("v")
-        if v in (2, 3, 4):
+        if v in (2, 3, 4, 10):
             self.cid = data.get("cid") or self.cid
             self.name = str(data.get("name") or "")[:16]
             self.solo = [float(m) for m in data.get("solo", [])]
             # keep only your own chests per room; the database has everyone else's
             self.rooms = {code: {"mine": [float(m) for m in r.get("mine", [])],
-                                 "epoch": int(r.get("epoch", 0)) if v == 4 else 0}
+                                 "epoch": int(r.get("epoch", 0)) if v in (4, 10) else 0}
                           for code, r in (data.get("rooms") or {}).items() if isinstance(r, dict)}
             room = data.get("room")
             self.room = room if room in self.rooms else None
+            self.carry = [float(m) for m in data.get("carry", [])]
+            if data.get("fb_uid") and data.get("fb_refresh"):
+                AUTH.uid, AUTH.refresh_token = data["fb_uid"], data["fb_refresh"]
+                self.cid = AUTH.uid
+            if v != 10 and self.rooms:
+                # first run with owner controls: old rooms can't have an owner, so your chests
+                # wait in "carry" and go into the new room you join
+                if self.room:
+                    self.carry = self.rooms[self.room]["mine"] + self.carry
+                self.rooms, self.room = {}, None
+                self.migrated = True
             return
         # ---- upgrade from v1 ----
         self.solo = [float(m) for m in data.get("history", [])]
@@ -1020,7 +1206,7 @@ class Tracker:
 
     def close(self):
         self.auto.stop()
-        if self.room and self.dirty and self.R is not None:
+        if self.room and self.dirty and self.R is not None and AUTH.fresh() and AUTH.uid == self.cid:
             try:
                 db_request(f"rooms/{self.room}/players/{self.cid}", "PUT",
                            {"c": tally(self.R["mine"]), "epoch": self.R["epoch"], "n": self.name,
