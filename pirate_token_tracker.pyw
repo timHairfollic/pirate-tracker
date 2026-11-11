@@ -1,10 +1,10 @@
 """
-Fortnite Pirate Token Chest Tracker (with Duo sync) - v6
+Fortnite Pirate Token Chest Tracker (with team sync) - v7
 --------------------------------------------------------
 UP arrow   = +1 chest (works even while Fortnite is focused)
 DOWN arrow = undo your last chest
 
-Duo sync: everyone types the same room code and presses Join.
+Team sync (duos, trios, squads): everyone types the same room code and presses Join.
 Each tracker keeps its OWN chest count and shares it instantly through the
 room's Firebase database. Whoever creates the room is its leader, and only
 the leader can reset it.
@@ -35,7 +35,7 @@ except ImportError:
     mb.showerror("Missing package", "Open Command Prompt and run:\n\npython -m pip install pynput\n\nthen start the tracker again.")
     raise SystemExit
 
-APP_VERSION = 6
+APP_VERSION = 7
 # Where updates come from. version.txt holds the newest version number;
 # pirate_token_tracker.pyw next to it is the new app. Leave "" to turn updates off.
 UPDATE_BASE = "https://raw.githubusercontent.com/timHairfollic/pirate-tracker/main/"
@@ -102,6 +102,8 @@ class Tracker:
         self.room = None                   # active room code
         self.rooms = {}                    # code -> {"mine": [...], "epoch": n}
         self.others = {}                   # cid -> counts (current room, from the database)
+        self.other_names = {}              # cid -> player name
+        self.name = ""                     # this player's name, shown to teammates
         self.leader = None                 # cid of the room's leader
         self.mode = tk.StringVar(value="Normal (1x)")
         self.on_top = tk.BooleanVar(value=True)
@@ -147,8 +149,9 @@ class Tracker:
         self.count_title.pack()
         self.count_lbl = tk.Label(inner, bg=CARD, fg=TEXT, font=F["big"])
         self.count_lbl.pack()
-        self.split_lbl = tk.Label(inner, bg=CARD, fg=DIM, font=F["plain"])
+        self.split_lbl = tk.Label(inner, bg=CARD, fg=DIM, font=F["plain"], wraplength=380, justify="center")
         self.split_lbl.pack()
+        self.split_lbl.bind("<Button-1>", lambda e: self.rename() if self.room else None)
         tk.Label(inner, text="~ CHANCE YE'D HAVE FOUND THE TOKEN ~", bg=CARD, fg=DIM, font=F["small"]).pack(pady=(8, 0))
         self.odds_lbl = tk.Label(inner, bg=CARD, fg=GOLD, font=F["odds"])
         self.odds_lbl.pack()
@@ -179,7 +182,7 @@ class Tracker:
 
         duo = tk.Frame(page, bg=BG)
         duo.pack(pady=(10, 0))
-        tk.Label(duo, text="Duo room:", bg=BG, fg=TEXT, font=F["body"]).pack(side="left")
+        tk.Label(duo, text="Team room:", bg=BG, fg=TEXT, font=F["body"]).pack(side="left")
         self.room_entry = tk.Entry(duo, textvariable=self.room_var, width=9, bg="#f3e4bf", fg=TEXT,
                                    insertbackground=TEXT, relief="sunken", bd=2, font=F["body"], justify="center")
         self.room_entry.pack(side="left", padx=4, ipady=2)
@@ -428,9 +431,9 @@ class Tracker:
 
     def reset(self):
         if self.room and not self.is_leader():
-            mb.showinfo("Reset", "Only the room leader can reset the duo count.", parent=self.root)
+            mb.showinfo("Reset", "Only the room leader can reset the team count.", parent=self.root)
             return
-        msg = "Reset the duo count to 0 for EVERYONE in the room?" if self.room else "Reset your chest count to 0?"
+        msg = "Reset the team count to 0 for EVERYONE in the room?" if self.room else "Reset your chest count to 0?"
         if not mb.askyesno("Reset", msg, parent=self.root):
             return
         if self.room:
@@ -439,7 +442,8 @@ class Tracker:
             self.R["mine"].clear()
             self.others = {}
             code, cid = self.room, self.cid
-            payload = {"epoch": new_epoch, "players": {cid: {"c": {}, "epoch": new_epoch, "t": int(time.time())}}}
+            payload = {"epoch": new_epoch,
+                       "players": {cid: {"c": {}, "epoch": new_epoch, "n": self.name, "t": int(time.time())}}}
             threading.Thread(target=lambda: self._safe(lambda: db_request(f"rooms/{code}", "PATCH", payload)),
                              daemon=True).start()
         else:
@@ -471,17 +475,32 @@ class Tracker:
         code = code.replace("O", "0").replace("I", "1").replace("L", "1")  # forgive look-alikes
         if len(code) < 4:
             mb.showinfo("Room code", "Type a room code (at least 4 letters/numbers),\n"
-                                     "or press New code and send it to your duo.", parent=self.root)
+                                     "or press New code and send it to your team.", parent=self.root)
             return
         self.room_var.set(code)
         is_new = code not in self.rooms
         self.rooms.setdefault(code, {"mine": [], "epoch": 0})
         if is_new and self.solo and mb.askyesno(
                 "Bring your chests?", f"You have {len(self.solo):,} solo chests counted.\n"
-                                      f"Add them to your count in this duo room?", parent=self.root):
+                                      f"Add them to your count in this team room?", parent=self.root):
             self.rooms[code]["mine"].extend(self.solo)
+        if not self.name:
+            self.rename(first=True)
         self.enter_room(code)
         self.refresh(); self.save()
+
+    def rename(self, first=False):
+        name = sd.askstring("Your name", "What name should your team see?" if first else "Change your name:",
+                            parent=self.root, initialvalue=self.name or "")
+        if name is None and not first:
+            return
+        name = (name or "").strip()[:16] or f"Player {self.cid[:3].upper()}"
+        if name != self.name:
+            self.name = name
+            if self.room:
+                self.dirty = True
+                self.push_soon()
+            self.refresh(); self.save()
 
     def enter_room(self, code):
         self.room = code
@@ -503,7 +522,7 @@ class Tracker:
         if not self.room or not self.dirty:
             return
         code, cid = self.room, self.cid
-        snap = {"c": tally(self.R["mine"]), "epoch": self.R["epoch"], "t": int(time.time())}
+        snap = {"c": tally(self.R["mine"]), "epoch": self.R["epoch"], "n": self.name, "t": int(time.time())}
         self.dirty = False
 
         def worker():
@@ -574,10 +593,13 @@ class Tracker:
             self.dirty = True
         self.leader = data.get("leader")
         players = data.get("players") or {}
-        self.others = {cid: untally(p.get("c")) for cid, p in players.items()
-                       if cid != self.cid and isinstance(p, dict) and int(p.get("epoch") or 0) == R["epoch"]}
+        team = {cid: p for cid, p in players.items()
+                if cid != self.cid and isinstance(p, dict) and int(p.get("epoch") or 0) == R["epoch"]}
+        self.others = {cid: untally(p.get("c")) for cid, p in team.items()}
+        self.other_names = {cid: str(p.get("n") or f"Player {cid[:3].upper()}")[:16] for cid, p in team.items()}
         mine_online = players.get(self.cid)
-        if not isinstance(mine_online, dict) or untally(mine_online.get("c")) != untally(tally(R["mine"])):
+        if (not isinstance(mine_online, dict) or untally(mine_online.get("c")) != untally(tally(R["mine"]))
+                or mine_online.get("n", "") != self.name):
             self.dirty = True
         if self.dirty:
             self.push_soon()
@@ -672,7 +694,9 @@ class Tracker:
         n = sum(counts.values())
         pct = odds_from_counts(counts) * 100
         decimals = 5 if pct < 0.01 else 4 if pct < 1 else 2
-        self.count_title.config(text="DUO CHESTS OPENED" if self.room else "CHESTS OPENED")
+        size = 1 + len(self.others) if self.room else 1
+        team_word = {2: "DUO", 3: "TRIO", 4: "SQUAD"}.get(size, "CREW" if size > 4 else "TEAM")
+        self.count_title.config(text=f"{team_word} CHESTS OPENED" if self.room else "CHESTS OPENED")
         self.count_lbl.config(text=f"{n:,}")
         self.odds_lbl.config(text=f"{pct:.{decimals}f}%")
         mult = MODES[self.mode.get()]
@@ -680,12 +704,13 @@ class Tracker:
         self.draw_progress()
         if self.room:
             mine = len(self.R["mine"])
-            split = f"You: {mine:,}"
-            if self.others:
-                split += "   ·   Duo: " + "  +  ".join(f"{sum(c.values()):,}" for c in self.others.values())
-            else:
-                split += "   ·   Duo: waiting for them to join…"
-            self.split_lbl.config(text=split)
+            parts = [f"{self.name} (you): {mine:,}" if self.name else f"You: {mine:,}"]
+            for cid, c in sorted(self.others.items(), key=lambda kv: -sum(kv[1].values())):
+                parts.append(f"{self.other_names.get(cid, 'Player')}: {sum(c.values()):,}")
+            split = "   ·   ".join(parts)
+            if not self.others:
+                split += "   ·   waiting for your team to join…"
+            self.split_lbl.config(text=split + "   ✎", cursor="hand2", wraplength=int(380 * self._scale))
             self.join_btn.config(text="Leave")
             self.code_btn.pack_forget()
             self.room_entry.config(state="disabled", disabledbackground=CARD, disabledforeground=GOLD)
@@ -698,18 +723,18 @@ class Tracker:
             else:
                 self.status_lbl.config(text=f"○ Connecting to room {self.room}…", fg=DIM)
         else:
-            self.split_lbl.config(text="")
+            self.split_lbl.config(text="", cursor="")
             self.join_btn.config(text="Join")
             self.code_btn.pack(side="left", padx=2)
             self.room_entry.config(state="normal")
             self.reset_btn.config(state="normal")
-            self.status_lbl.config(text="Solo mode — join a room to share chests with your duo", fg=DIM)
+            self.status_lbl.config(text="Solo mode — join a room to share chests with your duo, trio or squad", fg=DIM)
 
     # ---------- save / load ----------
     def save(self):
         try:
             with open(SAVE_FILE, "w") as f:
-                json.dump({"v": 4, "cid": self.cid, "solo": self.solo, "mode": self.mode.get(), "room": self.room,
+                json.dump({"v": 4, "cid": self.cid, "name": self.name, "solo": self.solo, "mode": self.mode.get(), "room": self.room,
                            "rooms": self.rooms, "geometry": self.root.winfo_geometry()}, f)
         except (OSError, tk.TclError):
             pass
@@ -726,6 +751,7 @@ class Tracker:
         v = data.get("v")
         if v in (2, 3, 4):
             self.cid = data.get("cid") or self.cid
+            self.name = str(data.get("name") or "")[:16]
             self.solo = [float(m) for m in data.get("solo", [])]
             # keep only your own chests per room; the database has everyone else's
             self.rooms = {code: {"mine": [float(m) for m in r.get("mine", [])],
@@ -745,7 +771,8 @@ class Tracker:
         if self.room and self.dirty and self.R is not None:
             try:
                 db_request(f"rooms/{self.room}/players/{self.cid}", "PUT",
-                           {"c": tally(self.R["mine"]), "epoch": self.R["epoch"], "t": int(time.time())}, timeout=3)
+                           {"c": tally(self.R["mine"]), "epoch": self.R["epoch"], "n": self.name,
+                            "t": int(time.time())}, timeout=3)
             except Exception:
                 pass
         self._stream_gen += 1
