@@ -1,5 +1,5 @@
 """
-Fortnite Pirate Token Chest Tracker (with Duo sync) - v4
+Fortnite Pirate Token Chest Tracker (with Duo sync) - v5
 --------------------------------------------------------
 UP arrow   = +1 chest (works even while Fortnite is focused)
 DOWN arrow = undo your last chest
@@ -14,6 +14,7 @@ where p is the per-chest rate active when that chest was counted.
 Normal: 1 in 137,500   Treasure Hour 1.5x: 1 in 91,667   Treasure Hour 2x: 1 in 68,750
 """
 import json
+import math
 import os
 import random
 import subprocess
@@ -34,7 +35,7 @@ except ImportError:
     mb.showerror("Missing package", "Open Command Prompt and run:\n\npython -m pip install pynput\n\nthen start the tracker again.")
     raise SystemExit
 
-APP_VERSION = 4
+APP_VERSION = 5
 # Where updates come from. version.txt holds the newest version number;
 # pirate_token_tracker.pyw next to it is the new app. Leave "" to turn updates off.
 UPDATE_BASE = "https://raw.githubusercontent.com/timHairfollic/pirate-tracker/main/"
@@ -49,7 +50,12 @@ _APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else
 SAVE_FILE = os.path.join(_APP_DIR, "pirate_tracker_save.json")
 CODE_CHARS = "ACDEFHJKMNPRTUVWXY34679"   # no look-alikes (O/0, I/1/L, S/5, B/8, Z/2, G)
 
-BG, CARD, GOLD, TEXT, DIM, GREEN, RED = "#14110d", "#221c14", "#f2b632", "#f4ead8", "#9c8f78", "#6fcf7a", "#e86a5a"
+# Treasure-map palette: parchment, ink and sealing-wax red
+BG, CARD, GOLD, TEXT, DIM, GREEN, RED = "#e9d3a0", "#dcc08a", "#7a1f12", "#2b1a0c", "#6b4a2b", "#2f5e22", "#8b1e1e"
+CHAR = "#120a04"                      # burnt edge
+SERIF = "Georgia"
+BURN_LAYERS = [(4, 22, "#2a160a"), (10, 20, "#4a2a12"), (16, 18, "#6e4420"), (22, 16, "#94652f"),
+               (28, 14, "#b78a4c"), (34, 12, "#d1ad70"), (40, 10, BG)]
 
 
 def odds_from_counts(counts):
@@ -111,18 +117,28 @@ class Tracker:
         self.load()
 
         root.title(f"Pirate Token Tracker v{APP_VERSION}")
-        root.configure(bg=BG)
+        root.configure(bg=CHAR)
         root.resizable(True, True)
         root.attributes("-topmost", True)
+        self._scale = 1.0
+        rnd = random.Random(1717)
+        self.noise = [rnd.random() for _ in range(400)]
+        self.bg = tk.Canvas(root, bg=CHAR, highlightthickness=0)
+        self.bg.place(x=0, y=0, relwidth=1, relheight=1)
+        self.page = tk.Frame(root, bg=BG)
+        page = self.page
 
         self.base_sizes = {"title": 13, "small": 9, "big": 34, "odds": 28, "body": 10, "plain": 9}
-        self.fonts = {k: tkfont.Font(family="Segoe UI", size=s, weight="normal" if k == "plain" else "bold")
+        self.fonts = {k: tkfont.Font(family=SERIF, size=s, weight="normal" if k == "plain" else "bold")
                       for k, s in self.base_sizes.items()}
         F = self.fonts
 
-        tk.Label(root, text="🏴‍☠️ PIRATE TOKEN TRACKER", bg=BG, fg=GOLD, font=F["title"]).pack(pady=(14, 6))
+        self.header = tk.Canvas(page, bg=BG, highlightthickness=0, height=74, width=420)
+        self.header.pack(pady=(4, 2), fill="x")
+        self.header.bind("<Configure>", lambda e: self.draw_header())
 
-        card = tk.Frame(root, bg=CARD, padx=24, pady=14)
+        card = tk.Frame(page, bg=CARD, padx=24, pady=14, highlightthickness=2,
+                        highlightbackground="#8a6236", highlightcolor="#8a6236")
         card.pack(padx=16, fill="both", expand=True)
         inner = tk.Frame(card, bg=CARD)
         inner.pack(expand=True)
@@ -132,56 +148,56 @@ class Tracker:
         self.count_lbl.pack()
         self.split_lbl = tk.Label(inner, bg=CARD, fg=DIM, font=F["plain"])
         self.split_lbl.pack()
-        tk.Label(inner, text="CHANCE YOU'D HAVE FOUND A TOKEN", bg=CARD, fg=DIM, font=F["small"]).pack(pady=(8, 0))
+        tk.Label(inner, text="~ CHANCE YE'D HAVE FOUND THE TOKEN ~", bg=CARD, fg=DIM, font=F["small"]).pack(pady=(8, 0))
         self.odds_lbl = tk.Label(inner, bg=CARD, fg=GOLD, font=F["odds"])
         self.odds_lbl.pack()
         self.per_lbl = tk.Label(inner, bg=CARD, fg=DIM, font=F["plain"])
         self.per_lbl.pack(pady=(4, 0))
 
-        row = tk.Frame(root, bg=BG)
+        row = tk.Frame(page, bg=BG)
         row.pack(pady=(10, 6))
         tk.Label(row, text="Rate:", bg=BG, fg=TEXT, font=F["body"]).pack(side="left")
         opt = tk.OptionMenu(row, self.mode, *MODES, command=lambda _: self.refresh())
-        opt.config(bg=CARD, fg=TEXT, activebackground=GOLD, highlightthickness=0, relief="flat", font=F["body"])
-        opt["menu"].config(bg=CARD, fg=TEXT)
+        opt.config(bg=CARD, fg=TEXT, activebackground="#c49a52", activeforeground=TEXT, highlightthickness=0,
+                   relief="ridge", bd=2, font=F["body"])
+        opt["menu"].config(bg=BG, fg=TEXT, activebackground="#c49a52", activeforeground=TEXT, font=F["body"])
         opt.pack(side="left", padx=6)
 
-        btns = tk.Frame(root, bg=BG)
+        btns = tk.Frame(page, bg=BG)
         btns.pack()
         for txt, cmd in (("+1", self.add), ("Undo", self.undo), ("Set count", self.set_count)):
-            tk.Button(btns, text=txt, command=cmd, width=8, bg=CARD, fg=TEXT, relief="flat",
-                      activebackground=GOLD, font=F["body"]).pack(side="left", padx=4)
-        self.reset_btn = tk.Button(btns, text="Reset", command=self.reset, width=8, bg=CARD, fg=TEXT, relief="flat",
-                                   activebackground=GOLD, disabledforeground="#5a5246", font=F["body"])
+            tk.Button(btns, text=txt, command=cmd, width=8, **self.btn_style()).pack(side="left", padx=4)
+        self.reset_btn = tk.Button(btns, text="Reset", command=self.reset, width=8, **self.btn_style())
         self.reset_btn.pack(side="left", padx=4)
 
-        duo = tk.Frame(root, bg=BG)
+        duo = tk.Frame(page, bg=BG)
         duo.pack(pady=(10, 0))
         tk.Label(duo, text="Duo room:", bg=BG, fg=TEXT, font=F["body"]).pack(side="left")
-        self.room_entry = tk.Entry(duo, textvariable=self.room_var, width=9, bg=CARD, fg=TEXT,
-                                   insertbackground=TEXT, relief="flat", font=F["body"], justify="center")
+        self.room_entry = tk.Entry(duo, textvariable=self.room_var, width=9, bg="#f3e4bf", fg=TEXT,
+                                   insertbackground=TEXT, relief="sunken", bd=2, font=F["body"], justify="center")
         self.room_entry.pack(side="left", padx=4, ipady=2)
-        self.join_btn = tk.Button(duo, text="Join", command=self.toggle_room, width=6, bg=CARD, fg=TEXT,
-                                  relief="flat", activebackground=GOLD, font=F["body"])
+        self.join_btn = tk.Button(duo, text="Join", command=self.toggle_room, width=6, **self.btn_style())
         self.join_btn.pack(side="left", padx=2)
-        self.code_btn = tk.Button(duo, text="New code", command=self.new_code, bg=CARD, fg=TEXT, relief="flat",
-                                  activebackground=GOLD, font=F["body"])
+        self.code_btn = tk.Button(duo, text="New code", command=self.new_code, **self.btn_style())
         self.code_btn.pack(side="left", padx=2)
-        self.status_lbl = tk.Label(root, bg=BG, fg=DIM, font=F["plain"])
+        self.status_lbl = tk.Label(page, bg=BG, fg=DIM, font=F["plain"])
         self.status_lbl.pack(pady=(4, 0))
 
-        tk.Checkbutton(root, text="Keep on top of game", variable=self.on_top, bg=BG, fg=DIM,
-                       selectcolor=CARD, activebackground=BG, activeforeground=TEXT, font=F["plain"],
+        tk.Checkbutton(page, text="Keep on top of game", variable=self.on_top, bg=BG, fg=DIM,
+                       selectcolor="#f3e4bf", activebackground=BG, activeforeground=TEXT, font=F["plain"],
                        command=lambda: root.attributes("-topmost", self.on_top.get())).pack(pady=(6, 0))
-        tk.Label(root, text="↑ Up arrow = +1 chest    ↓ Down arrow = undo", bg=BG, fg=DIM,
-                 font=F["plain"]).pack(pady=(4, 14))
+        tk.Label(page, text="↑ Up arrow = +1 chest    ↓ Down arrow = undo", bg=BG, fg=DIM,
+                 font=F["plain"]).pack(pady=(4, 6))
 
         root.update_idletasks()
-        self.base_w, self.base_h = root.winfo_reqwidth(), root.winfo_reqheight()
+        self.base_w = page.winfo_reqwidth() + 2 * 62
+        self.base_h = page.winfo_reqheight() + 2 * 62
         root.geometry(f"{self.base_w}x{self.base_h}")
         root.minsize(int(self.base_w * 0.6), int(self.base_h * 0.6))
         self._scale = 1.0
         root.bind("<Configure>", self.on_resize)
+        self.page.place(relx=0.5, rely=0.5, anchor="center")
+        self.root.after(50, self.draw_map)
         if self._saved_geometry:
             try:
                 root.geometry(self._saved_geometry)
@@ -222,12 +238,90 @@ class Tracker:
     def on_resize(self, event):
         if event.widget is not self.root:
             return
+        self.root.after_idle(self.draw_map)
         scale = max(0.6, round(min(event.width / self.base_w, event.height / self.base_h), 2))
         if abs(scale - self._scale) < 0.03:
             return
         self._scale = scale
         for k, f in self.fonts.items():
             f.configure(size=max(7, int(self.base_sizes[k] * scale)))
+        self.header.config(height=int(74 * scale), width=int(420 * scale))
+        self.draw_header()
+
+    # ---------- treasure-map drawing ----------
+    def btn_style(self):
+        return dict(bg=CARD, fg=TEXT, relief="ridge", bd=2, activebackground="#c49a52", activeforeground=TEXT,
+                    disabledforeground="#a08a62", font=self.fonts["body"], cursor="hand2")
+
+    def ragged(self, w, h, inset, amp, step=16):
+        """Points around the window edge, pushed inward by a burnt, ragged amount."""
+        pts, i = [], 0
+        def off(k):
+            return inset + amp * self.noise[k % len(self.noise)]
+        x = 0
+        while x < w:                        # top edge
+            pts += [x, off(i)]; i += 1; x += step
+        y = 0
+        while y < h:                        # right edge
+            pts += [w - off(i), y]; i += 1; y += step
+        x = w
+        while x > 0:                        # bottom edge
+            pts += [x, h - off(i)]; i += 1; x -= step
+        y = h
+        while y > 0:                        # left edge
+            pts += [off(i), y]; i += 1; y -= step
+        return pts
+
+    def draw_map(self):
+        c = self.bg
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        if w < 50 or h < 50:
+            return
+        c.delete("all")
+        for inset, amp, color in BURN_LAYERS:
+            c.create_polygon(self.ragged(w, h, inset, amp), fill=color, outline="", smooth=True)
+        # age stains and scorch spots on the parchment margins
+        for fx, fy, r, col in ((0.12, 0.18, 34, "#d8b97c"), (0.9, 0.82, 44, "#d5b478"),
+                               (0.85, 0.12, 22, "#cfa96b"), (0.1, 0.88, 26, "#cda766")):
+            c.create_oval(fx * w - r, fy * h - r, fx * w + r, fy * h + r, outline=col, width=3)
+        for fx, fy, r in ((0.06, 0.5, 9), (0.95, 0.4, 7), (0.5, 0.97, 8)):
+            c.create_oval(fx * w - r, fy * h - r, fx * w + r, fy * h + r, fill="#5a3416", outline="")
+
+    def draw_header(self):
+        c = self.header
+        c.delete("all")
+        w = max(c.winfo_width(), 200)
+        h = max(c.winfo_height(), 60)
+        s = self._scale
+        cx, cy = w / 2, h / 2
+        # dotted trail leading to the X
+        trail = [(30 * s, h - 12), (w * 0.2, h * 0.75), (w * 0.35, h - 8), (w * 0.65, h - 6), (w * 0.8, h * 0.72),
+                 (w - 34 * s, h * 0.5)]
+        flat = [v for p in trail for v in p]
+        c.create_line(*flat, smooth=True, fill="#8a6236", dash=(4, 5), width=2)
+        # red X marks the spot
+        x0, y0, r = w - 34 * s, h * 0.5, 9 * s
+        c.create_line(x0 - r, y0 - r, x0 + r, y0 + r, fill=RED, width=max(2, int(4 * s)), capstyle="round")
+        c.create_line(x0 - r, y0 + r, x0 + r, y0 - r, fill=RED, width=max(2, int(4 * s)), capstyle="round")
+        # compass rose
+        rx, ry, R = 30 * s, h * 0.42, 20 * s
+        c.create_oval(rx - R, ry - R, rx + R, ry + R, outline="#6b4a2b", width=1)
+        for a in range(0, 360, 45):
+            L = R if a % 90 == 0 else R * 0.55
+            ang = math.radians(a)
+            tip = (rx + L * math.sin(ang), ry - L * math.cos(ang))
+            side1 = (rx + 4 * s * math.sin(ang + math.pi / 2), ry - 4 * s * math.cos(ang + math.pi / 2))
+            side2 = (rx + 4 * s * math.sin(ang - math.pi / 2), ry - 4 * s * math.cos(ang - math.pi / 2))
+            c.create_polygon(*side1, *tip, rx, ry, fill=TEXT if a % 90 == 0 else DIM, outline="")
+            c.create_polygon(*side2, *tip, rx, ry, fill="#b08a55", outline="")
+        c.create_text(rx, ry - R - 6 * s, text="N", fill=TEXT, font=(SERIF, max(6, int(7 * s)), "bold"))
+        # title lettering
+        c.create_text(cx + 1, cy - 4 * s + 1, text="Pirate Token Tracker", fill="#c9a064",
+                      font=(SERIF, max(9, int(19 * s)), "bold italic"))
+        c.create_text(cx, cy - 4 * s, text="Pirate Token Tracker", fill=TEXT,
+                      font=(SERIF, max(9, int(19 * s)), "bold italic"))
+        c.create_text(cx, cy + 16 * s, text="☠  a ledger of chests plundered  ☠", fill=DIM,
+                      font=(SERIF, max(7, int(9 * s)), "italic"))
 
     # ---------- input ----------
     def on_key(self, key):
@@ -478,7 +572,7 @@ class Tracker:
         win.protocol("WM_DELETE_WINDOW", lambda: None)   # can't be closed
         win.transient(self.root)
         self.upd_lbl = tk.Label(win, text=f"Updating to v{latest}…\nYour chest count is saved.",
-                                bg=BG, fg=GOLD, font=("Segoe UI", 12, "bold"), padx=30, pady=24)
+                                bg=BG, fg=GOLD, font=(SERIF, 12, "bold"), padx=30, pady=24)
         self.upd_lbl.pack()
         win.grab_set()
 
@@ -597,7 +691,36 @@ class Tracker:
         self.root.destroy()
 
 
+def rescue_update(err):
+    """If the app ever crashes on startup, still pull a fixed version from GitHub."""
+    try:
+        latest = int(urllib.request.urlopen(UPDATE_BASE + "version.txt", timeout=10).read().decode().strip())
+        if latest > APP_VERSION:
+            req = urllib.request.Request(UPDATE_API, headers={"Accept": "application/vnd.github.raw"})
+            code = urllib.request.urlopen(req, timeout=30).read()
+            compile(code.decode("utf-8"), "update", "exec")
+            me = os.path.abspath(__file__)
+            with open(me + ".new", "wb") as f:
+                f.write(code)
+            os.replace(me + ".new", me)
+            subprocess.Popen([sys.executable, me], cwd=_APP_DIR)
+            return
+    except Exception:
+        pass
+    r = tk.Tk(); r.withdraw()
+    mb.showerror("Pirate Tracker crashed", f"Something broke on startup:\n\n{err}\n\n"
+                                           "Send a screenshot of this to whoever runs the tracker.")
+
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    Tracker(root)
+    try:
+        root = tk.Tk()
+        Tracker(root)
+    except Exception as e:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        rescue_update(e)
+        raise SystemExit
     root.mainloop()
